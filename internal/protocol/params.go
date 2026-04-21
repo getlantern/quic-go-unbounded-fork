@@ -132,11 +132,18 @@ const MinPacingDelay = time.Millisecond
 // if no other value is configured.
 const DefaultConnectionIDLength = 4
 
+// XXX nelson 08/14/2025: Increasing the values for MaxActiveConnectionIDs and MaxIssuedConnectionIDs
+// increases the number of lifetime migrations possible for a given QUIC connection. It's hard to
+// know how many migrations per connection our users will need without first knowing the churn rate
+// of the peer network and the average session duration for a Lantern user, and I don't know either
+// of those things. I'm also not sure what's a sane range for these values before we start straining
+// our resources. So I just +50'd both. YOLO.
+
 // MaxActiveConnectionIDs is the number of connection IDs that we're storing.
-const MaxActiveConnectionIDs = 4
+const MaxActiveConnectionIDs = 54
 
 // MaxIssuedConnectionIDs is the maximum number of connection IDs that we're issuing at the same time.
-const MaxIssuedConnectionIDs = 6
+const MaxIssuedConnectionIDs = 56
 
 // PacketsPerConnectionID is the number of packets we send using one connection ID.
 // If the peer provices us with enough new connection IDs, we switch to a new connection ID.
