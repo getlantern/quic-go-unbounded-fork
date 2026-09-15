@@ -2,6 +2,7 @@ package quic
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -17,6 +18,7 @@ func TestPathManagerOutgoingPathProbing(t *testing.T) {
 		connIDs := []protocol.ConnectionID{
 			protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8}),
 		}
+		var scheduled atomic.Int64
 		pm := newPathManagerOutgoing(
 			func(id pathID) (protocol.ConnectionID, bool) {
 				connID := connIDs[0]
@@ -24,7 +26,7 @@ func TestPathManagerOutgoingPathProbing(t *testing.T) {
 				return connID, true
 			},
 			func(id pathID) { t.Fatal("didn't expect any connection ID to be retired") },
-			func() {},
+			func() { scheduled.Add(1) },
 		)
 
 		_, _, _, ok := pm.NextPathToProbe()
@@ -99,7 +101,9 @@ func TestPathManagerOutgoingPathProbing(t *testing.T) {
 		// now switch to the other path
 		_, ok = pm.ShouldSwitchPath()
 		require.False(t, ok)
+		beforeSwitch := scheduled.Load()
 		require.NoError(t, p.Switch())
+		require.Equal(t, beforeSwitch+1, scheduled.Load(), "switch must wake the connection send loop")
 		// the active path can't be closed
 		require.EqualError(t, p.Close(), "cannot close active path")
 		switchToTransport, ok := pm.ShouldSwitchPath()

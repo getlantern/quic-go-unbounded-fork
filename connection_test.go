@@ -3388,6 +3388,32 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 	})
 }
 
+func TestConnectionMigrationProbeWhenCongestionLimited(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	sph := mockackhandler.NewMockSentPacketHandler(ctrl)
+	tc := newClientTestConnection(t, ctrl, nil, false,
+		connectionOptHandshakeConfirmed(), connectionOptSentPacketHandler(sph))
+	sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAck).AnyTimes()
+	sph.EXPECT().ECNMode(gomock.Any()).Return(protocol.ECNNon).AnyTimes()
+	tc.packer.EXPECT().PackAckOnlyPacket(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(shortHeaderPacket{}, nil, errNothingToPack).AnyTimes()
+	pm := newPathManagerOutgoing(
+		func(pathID) (protocol.ConnectionID, bool) { return tc.destConnID, true },
+		func(pathID) {}, func() {},
+	)
+	path := pm.NewPath(nil, time.Second, func() {})
+	pm.addPath(path, path.enablePath)
+	pm.enqueueProbe(path)
+	tc.conn.pathManagerOutgoing.Store(pm)
+
+	// Stop at packet packing: the probe must reach this point despite the old
+	// path allowing only ACKs, without sending ordinary stream data.
+	probeErr := errors.New("reached replacement path probe")
+	tc.packer.EXPECT().PackPathProbePacket(tc.destConnID, gomock.Any(), gomock.Any()).
+		Return(shortHeaderPacket{}, nil, probeErr)
+	require.ErrorIs(t, tc.conn.triggerSending(monotime.Now()), probeErr)
+}
+
 func TestConnectionMigrationServer(t *testing.T) {
 	tc := newServerTestConnection(t, nil, nil, false)
 	_, err := tc.conn.AddPath(&Transport{})

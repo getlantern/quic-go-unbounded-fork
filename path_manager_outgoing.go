@@ -209,6 +209,7 @@ func (pm *pathManagerOutgoing) switchToPath(id pathID) error {
 	}
 	pm.pathToSwitchTo = p
 	pm.activePath = id
+	pm.scheduleSending()
 	return nil
 }
 

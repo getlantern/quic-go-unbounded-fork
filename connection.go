@@ -921,6 +921,9 @@ func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
 	c.conn = newSendConn(tr.conn, c.conn.RemoteAddr(), packetInfo{}, utils.DefaultLogger) // TODO: find a better way
 	c.sendQueue.Close()
 	c.sendQueue = newSendQueue(c.conn)
+	// A server only switches its return path after a non-probing packet.
+	// Send one even if the application has no data queued on this endpoint.
+	c.framer.QueueControlFrame(&wire.PingFrame{})
 	go func() {
 		if err := c.sendQueue.Run(); err != nil {
 			c.destroyImpl(err)
@@ -2451,6 +2454,28 @@ func (c *Conn) applyTransportParameters() {
 func (c *Conn) triggerSending(now monotime.Time) error {
 	c.pacingDeadline = 0
 
+	// A replacement path must be probed even when lost packets on the old
+	// path fill its congestion window. Otherwise a dead path prevents its own
+	// replacement. Probe retries are bounded by the path manager backoff.
+	if c.perspective == protocol.PerspectiveClient && c.handshakeConfirmed {
+		if pm := c.pathManagerOutgoing.Load(); pm != nil {
+			connID, frame, tr, ok := pm.NextPathToProbe()
+			if ok {
+				probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, c.version)
+				if err != nil {
+					return err
+				}
+				c.logger.Debugf("sending path probe packet from %s", c.LocalAddr())
+				c.logShortHeaderPacket(probe, protocol.ECNNon, buf.Len())
+				c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, now)
+				tr.WriteTo(buf.Data, c.conn.RemoteAddr())
+				// There's (likely) more data to send. Loop around again.
+				c.scheduleSending()
+				return nil
+			}
+		}
+	}
+
 	sendMode := c.sentPacketHandler.SendMode(now)
 	switch sendMode {
 	case ackhandler.SendAny:
@@ -2489,25 +2514,6 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 }
 
 func (c *Conn) sendPackets(now monotime.Time) error {
-	if c.perspective == protocol.PerspectiveClient && c.handshakeConfirmed {
-		if pm := c.pathManagerOutgoing.Load(); pm != nil {
-			connID, frame, tr, ok := pm.NextPathToProbe()
-			if ok {
-				probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, c.version)
-				if err != nil {
-					return err
-				}
-				c.logger.Debugf("sending path probe packet from %s", c.LocalAddr())
-				c.logShortHeaderPacket(probe, protocol.ECNNon, buf.Len())
-				c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, now)
-				tr.WriteTo(buf.Data, c.conn.RemoteAddr())
-				// There's (likely) more data to send. Loop around again.
-				c.scheduleSending()
-				return nil
-			}
-		}
-	}
-
 	// Path MTU Discovery
 	// Can't use GSO, since we need to send a single packet that's larger than our current maximum size.
 	// Performance-wise, this doesn't matter, since we only send a very small (<10) number of
