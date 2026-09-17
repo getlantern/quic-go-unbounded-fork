@@ -750,7 +750,7 @@ func (c *probeWriteConn) WritePacket(b []byte, addr net.Addr, oob []byte, size u
 
 func TestTransportProbeQueueBoundedAndSurvivesWriteError(t *testing.T) {
 	started, unblock, recovered := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	info := packetInfo{addr: netip.MustParseAddr("127.0.0.1"), ifIndex: 1}
+	info := packetInfo{addr: netip.MustParseAddr("127.0.0.1")}
 	tr := &Transport{probeQueue: make(chan closePacket, maxPathResponses), listening: make(chan struct{}), logger: utils.DefaultLogger}
 	tr.initOnce.Do(func() {})
 	writes := 0
