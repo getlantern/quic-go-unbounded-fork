@@ -1770,3 +1770,15 @@ func benchmarkSendAndAcknowledge(b *testing.B, ackEvery, inFlight int) {
 		}
 	}
 }
+
+func TestLostPathResponseWithoutHandler(t *testing.T) {
+	sph := NewSentPacketHandler(0, 1200, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveClient, nil, utils.DefaultLogger).(*sentPacketHandler)
+	now := monotime.Now()
+	pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+	sph.SentPacket(now, pn, protocol.InvalidPacketNumber, nil,
+		[]Frame{{Frame: &wire.PathResponseFrame{Data: [8]byte{1}}}},
+		protocol.Encryption1RTT, protocol.ECNNon, 1200, false, true)
+	require.True(t, sph.appDataPackets.history.HasOutstandingPathProbes())
+	sph.detectLostPathProbes(now.Add(pathProbePacketLossTimeout + time.Second))
+	require.False(t, sph.appDataPackets.history.HasOutstandingPathProbes())
+}

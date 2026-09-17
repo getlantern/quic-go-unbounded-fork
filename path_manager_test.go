@@ -354,3 +354,18 @@ func TestAddrsEqual(t *testing.T) {
 		})
 	}
 }
+
+func TestPathManagerRetiresPreviousActivePath(t *testing.T) {
+	var retired []pathID
+	pm := newPathManager(func(pathID) (protocol.ConnectionID, bool) { return protocol.ConnectionID{}, true },
+		func(id pathID) { retired = append(retired, id) }, utils.DefaultLogger)
+	for i := range 8 {
+		addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1000 + i}
+		pm.HandlePacket(addr, monotime.Now(), &wire.PathChallengeFrame{}, true)
+		pm.SwitchToPath(addr)
+		require.Len(t, retired, i)
+		if i > 0 {
+			require.Equal(t, pathID(i-1), retired[i-1])
+		}
+	}
+}

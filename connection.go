@@ -925,7 +925,7 @@ func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
 	c.sendQueue = newSendQueue(c.conn)
 	// A server only switches its return path after a non-probing packet.
 	// Send one even if the application has no data queued on this endpoint.
-	c.framer.QueueControlFrame(&wire.PingFrame{})
+	c.queueControlFrame(&wire.PingFrame{})
 	go func() {
 		if err := c.sendQueue.Run(); err != nil {
 			c.destroyImpl(err)
@@ -1255,20 +1255,34 @@ func (c *Conn) handleShortHeaderPacket(
 			})
 		}
 	}
-	isNonProbing, pathChallenge, err := c.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log)
+	isNonProbing, pathChallenges, err := c.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log)
 	if err != nil {
 		return false, err
 	}
 
 	// In RFC 9000, only the client can migrate between paths.
 	if c.perspective == protocol.PerspectiveClient {
-		if pathChallenge != nil {
-			return true, c.respondToPathChallenge(p, pathChallenge)
+		for _, challenge := range pathChallenges {
+			if err := c.respondToPathChallenge(p, challenge); err != nil {
+				return true, err
+			}
 		}
 		return true, nil
 	}
 	if addrsEqual(p.remoteAddr, c.RemoteAddr()) {
+		for _, challenge := range pathChallenges {
+			c.queueControlFrame(&wire.PathResponseFrame{Data: challenge.Data})
+		}
 		return true, nil
+	}
+	var pathChallenge *wire.PathChallengeFrame
+	if len(pathChallenges) > 0 {
+		pathChallenge = pathChallenges[len(pathChallenges)-1]
+		for _, challenge := range pathChallenges[:len(pathChallenges)-1] {
+			if err := c.respondToPathChallenge(p, challenge); err != nil {
+				return true, err
+			}
+		}
 	}
 
 	var shouldSwitchPath bool
@@ -1752,12 +1766,12 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
 	ecn protocol.ECN,
 	rcvTime monotime.Time,
 	log func([]qlog.Frame),
-) (isNonProbing bool, pathChallenge *wire.PathChallengeFrame, _ error) {
+) (isNonProbing bool, pathChallenges []*wire.PathChallengeFrame, _ error) {
 	c.lastPacketReceivedTime = rcvTime
 	c.firstAckElicitingPacketAfterIdleSentTime = 0
 	c.keepAlivePingSent = false
 
-	isAckEliciting, isNonProbing, pathChallenge, err := c.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime)
+	isAckEliciting, isNonProbing, pathChallenges, err := c.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime)
 	if err != nil {
 		return false, nil, err
 	}
@@ -1765,18 +1779,18 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
 	if err := c.receivedPacketHandler.ReceivedPacket(pn, ecn, protocol.Encryption1RTT, rcvTime, isAckEliciting); err != nil {
 		return false, nil, err
 	}
-	return isNonProbing, pathChallenge, nil
+	return isNonProbing, pathChallenges, nil
 }
 
 // handleFrames parses the frames, one after the other, and handles them.
-// It returns the last PATH_CHALLENGE frame contained in the packet, if any.
+// It returns the PATH_CHALLENGE frames contained in the packet, bounded by maxPathResponses.
 func (c *Conn) handleFrames(
 	data []byte,
 	destConnID protocol.ConnectionID,
 	encLevel protocol.EncryptionLevel,
 	log func([]qlog.Frame),
 	rcvTime monotime.Time,
-) (isAckEliciting, isNonProbing bool, pathChallenge *wire.PathChallengeFrame, _ error) {
+) (isAckEliciting, isNonProbing bool, pathChallenges []*wire.PathChallengeFrame, _ error) {
 	// Only used for tracing.
 	// If we're not tracing, this slice will always remain empty.
 	var frames []qlog.Frame
@@ -1870,8 +1884,8 @@ func (c *Conn) handleFrames(
 				continue
 			}
 			pc, err := c.handleFrame(frame, encLevel, destConnID, rcvTime)
-			if pc != nil {
-				pathChallenge = pc
+			if pc != nil && len(pathChallenges) < maxPathResponses {
+				pathChallenges = append(pathChallenges, pc)
 			}
 			handleErr = err
 		}
@@ -1940,6 +1954,9 @@ func (c *Conn) handleFrame(
 		err = c.handleNewTokenFrame(frame)
 	case *wire.NewConnectionIDFrame:
 		err = c.connIDManager.Add(frame)
+		if err == nil && c.pathManagerOutgoing.Load() != nil {
+			c.scheduleSending()
+		}
 	case *wire.RetireConnectionIDFrame:
 		err = c.connIDGenerator.Retire(frame.SequenceNumber, destConnID, rcvTime.Add(3*c.rttStats.PTO(false)))
 	case *wire.HandshakeDoneFrame:
@@ -2063,12 +2080,7 @@ func (c *Conn) respondToPathChallenge(p receivedPacket, f *wire.PathChallengeFra
 	}
 	c.logShortHeaderPacket(probe, protocol.ECNNon, buf.Len())
 	c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, p.rcvTime)
-	if p.transport != nil {
-		defer buf.Release()
-		_, err = p.transport.WriteTo(buf.Data, p.remoteAddr)
-		return err
-	}
-	c.sendQueue.SendProbe(buf, p.remoteAddr, p.info)
+	p.transport.queueProbe(buf, p.remoteAddr, p.info)
 	return nil
 }
 
@@ -2485,7 +2497,7 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 				c.logger.Debugf("sending path probe packet from %s", c.LocalAddr())
 				c.logShortHeaderPacket(probe, protocol.ECNNon, buf.Len())
 				c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, now)
-				tr.WriteTo(buf.Data, c.conn.RemoteAddr())
+				tr.queueProbe(buf, c.conn.RemoteAddr(), packetInfo{})
 				// There's (likely) more data to send. Loop around again.
 				c.scheduleSending()
 				return nil

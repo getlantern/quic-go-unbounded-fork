@@ -112,6 +112,8 @@ func TestConnectionMigration(t *testing.T) {
 	require.NoError(t, path.Probe(ctx))
 	require.Less(t, int(packetsPath2.Load()), 5)
 
+	// Allow the return-path PATH_RESPONSE to arrive before counting application traffic.
+	time.Sleep(3 * rtt)
 	// make sure that no more packets are sent on path 2 before switching to the path
 	c2 := packetsPath2.Load()
 	sendAndReceiveFile(t) // stream 6

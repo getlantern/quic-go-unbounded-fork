@@ -124,9 +124,11 @@ const MinPacingDelay = time.Millisecond
 const DefaultConnectionIDLength = 4
 
 // MaxActiveConnectionIDs is the number of connection IDs that we're storing.
-const MaxActiveConnectionIDs = 54
+const MaxActiveConnectionIDs = 4
 
 // MaxIssuedConnectionIDs is the maximum number of connection IDs that we're issuing at the same time.
+// Legacy Unbounded peers advertise a 54-ID pool and retain IDs across migrations.
+// Keep that compatibility ceiling; current peers advertise the upstream four-ID limit.
 const MaxIssuedConnectionIDs = 56
 
 // PacketsPerConnectionID is the number of packets we send using one connection ID.
