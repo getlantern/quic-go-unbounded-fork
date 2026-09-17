@@ -45,7 +45,8 @@ type cryptoStreamHandler interface {
 }
 
 type receivedPacket struct {
-	buffer *packetBuffer
+	transport *Transport
+	buffer    *packetBuffer
 
 	remoteAddr net.Addr
 	rcvTime    monotime.Time
@@ -65,6 +66,7 @@ func (p *receivedPacket) Size() protocol.ByteCount { return protocol.ByteCount(l
 
 func (p *receivedPacket) Clone() *receivedPacket {
 	return &receivedPacket{
+		transport:  p.transport,
 		remoteAddr: p.remoteAddr,
 		rcvTime:    p.rcvTime,
 		data:       p.data,
@@ -1260,6 +1262,9 @@ func (c *Conn) handleShortHeaderPacket(
 
 	// In RFC 9000, only the client can migrate between paths.
 	if c.perspective == protocol.PerspectiveClient {
+		if pathChallenge != nil {
+			return true, c.respondToPathChallenge(p, pathChallenge)
+		}
 		return true, nil
 	}
 	if addrsEqual(p.remoteAddr, c.RemoteAddr()) {
@@ -1928,7 +1933,6 @@ func (c *Conn) handleFrame(
 		err = c.streamsMap.HandleStopSendingFrame(frame)
 	case *wire.PingFrame:
 	case *wire.PathChallengeFrame:
-		c.handlePathChallengeFrame(frame)
 		pathChallenge = frame
 	case *wire.PathResponseFrame:
 		err = c.handlePathResponseFrame(frame)
@@ -2049,10 +2053,23 @@ func (c *Conn) handleHandshakeEvents(now monotime.Time) error {
 	}
 }
 
-func (c *Conn) handlePathChallengeFrame(f *wire.PathChallengeFrame) {
-	if c.perspective == protocol.PerspectiveClient {
-		c.queueControlFrame(&wire.PathResponseFrame{Data: f.Data})
+// PATH_RESPONSE must travel on the path that carried PATH_CHALLENGE. Queueing
+// it as ordinary control traffic can send it down a dead path before Switch.
+func (c *Conn) respondToPathChallenge(p receivedPacket, f *wire.PathChallengeFrame) error {
+	probe, buf, err := c.packer.PackPathProbePacket(c.connIDManager.Get(),
+		[]ackhandler.Frame{{Frame: &wire.PathResponseFrame{Data: f.Data}}}, c.version)
+	if err != nil {
+		return err
 	}
+	c.logShortHeaderPacket(probe, protocol.ECNNon, buf.Len())
+	c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, p.rcvTime)
+	if p.transport != nil {
+		defer buf.Release()
+		_, err = p.transport.WriteTo(buf.Data, p.remoteAddr)
+		return err
+	}
+	c.sendQueue.SendProbe(buf, p.remoteAddr, p.info)
+	return nil
 }
 
 func (c *Conn) handlePathResponseFrame(f *wire.PathResponseFrame) error {

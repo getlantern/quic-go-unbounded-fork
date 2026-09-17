@@ -3388,6 +3388,35 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 	})
 }
 
+func TestConnectionPathResponseUsesReceivingTransport(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	sph := mockackhandler.NewMockSentPacketHandler(ctrl)
+	tc := newClientTestConnection(t, ctrl, nil, false,
+		connectionOptHandshakeConfirmed(), connectionOptSentPacketHandler(sph))
+	receiver := newUDPConnLocalhost(t)
+	incoming := &Transport{Conn: newUDPConnLocalhost(t)}
+	t.Cleanup(func() { _ = incoming.Close() })
+	challenge := &wire.PathChallengeFrame{Data: [8]byte{1, 2, 3}}
+	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ protocol.ConnectionID, frames []ackhandler.Frame, _ protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+			require.Len(t, frames, 1)
+			require.Equal(t, &wire.PathResponseFrame{Data: challenge.Data}, frames[0].Frame)
+			buf := getPacketBuffer()
+			buf.Data = append(buf.Data, []byte("response")...)
+			return shortHeaderPacket{IsPathProbePacket: true}, buf, nil
+		})
+	sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), true)
+	p := receivedPacket{transport: incoming, remoteAddr: receiver.LocalAddr(), rcvTime: monotime.Now()}
+	require.Same(t, incoming, p.Clone().transport)
+	require.NoError(t, tc.conn.respondToPathChallenge(p, challenge))
+	require.NoError(t, receiver.SetReadDeadline(time.Now().Add(time.Second)))
+	buf := make([]byte, 100)
+	n, source, err := receiver.ReadFrom(buf)
+	require.NoError(t, err)
+	require.Equal(t, "response", string(buf[:n]))
+	require.Equal(t, incoming.Conn.LocalAddr().String(), source.String())
+}
+
 func TestConnectionMigrationProbeWhenCongestionLimited(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	sph := mockackhandler.NewMockSentPacketHandler(ctrl)

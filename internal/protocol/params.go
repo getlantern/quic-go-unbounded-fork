@@ -124,10 +124,10 @@ const MinPacingDelay = time.Millisecond
 const DefaultConnectionIDLength = 4
 
 // MaxActiveConnectionIDs is the number of connection IDs that we're storing.
-const MaxActiveConnectionIDs = 4
+const MaxActiveConnectionIDs = 54
 
 // MaxIssuedConnectionIDs is the maximum number of connection IDs that we're issuing at the same time.
-const MaxIssuedConnectionIDs = 6
+const MaxIssuedConnectionIDs = 56
 
 // PacketsPerConnectionID is the number of packets we send using one connection ID.
 // If the peer provices us with enough new connection IDs, we switch to a new connection ID.
