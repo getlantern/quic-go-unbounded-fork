@@ -433,3 +433,14 @@ func benchmarkConnIDManager(b *testing.B, reordered bool) {
 		}
 	}
 }
+
+func TestConnIDRotationWithStockPeerPool(t *testing.T) {
+	m := newConnIDManager(protocol.ParseConnectionID([]byte{0}), func(protocol.StatelessResetToken) {}, func(protocol.StatelessResetToken) {}, func(wire.Frame) {})
+	for i := uint64(1); i < 4; i++ {
+		require.NoError(t, m.Add(&wire.NewConnectionIDFrame{SequenceNumber: i, ConnectionID: protocol.ParseConnectionID([]byte{byte(i)})}))
+	}
+	m.SetHandshakeComplete()
+	first := m.Get()
+	m.packetsSinceLastChange = m.packetsPerConnectionID
+	require.NotEqual(t, first, m.Get())
+}

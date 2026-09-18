@@ -155,6 +155,7 @@ type Transport struct {
 
 	conn rawConn
 
+	probeQueue          chan closePacket
 	closeQueue          chan closePacket
 	statelessResetQueue chan receivedPacket
 
@@ -395,6 +396,7 @@ func (t *Transport) init(allowZeroLengthConnIDs bool) error {
 		t.listening = make(chan struct{})
 
 		t.closeQueue = make(chan closePacket, 4)
+		t.probeQueue = make(chan closePacket, maxPathResponses)
 		t.statelessResetQueue = make(chan receivedPacket, 4)
 		if t.TokenGeneratorKey == nil {
 			var key TokenGeneratorKey
@@ -439,11 +441,35 @@ func (t *Transport) WriteTo(b []byte, addr net.Addr) (int, error) {
 	return t.conn.WritePacket(b, addr, nil, 0, protocol.ECNUnsupported)
 }
 
+// queueProbe transfers buffer ownership, even if the bounded queue is full.
+// Copying into the queue keeps pooled buffers out of transport shutdown races.
+func (t *Transport) queueProbe(buf *packetBuffer, addr net.Addr, info packetInfo) {
+	defer buf.Release()
+	if err := t.init(false); err != nil {
+		utils.DefaultLogger.Debugf("dropping path probe: %s", err)
+		return
+	}
+	select {
+	case <-t.listening:
+		return
+	default:
+	}
+	select {
+	case t.probeQueue <- closePacket{payload: append([]byte(nil), buf.Data...), addr: addr, info: info}:
+	default:
+		t.logger.Debugf("dropping path probe: send queue full")
+	}
+}
+
 func (t *Transport) runSendQueue() {
 	for {
 		select {
 		case <-t.listening:
 			return
+		case p := <-t.probeQueue:
+			if _, err := t.conn.WritePacket(p.payload, p.addr, p.info.OOB(), 0, protocol.ECNUnsupported); err != nil {
+				t.logger.Debugf("dropping path probe after write error: %s", err)
+			}
 		case p := <-t.closeQueue:
 			t.conn.WritePacket(p.payload, p.addr, p.info.OOB(), 0, protocol.ECNUnsupported)
 		case p := <-t.statelessResetQueue:
@@ -562,6 +588,7 @@ func (t *Transport) maybeStopListening() {
 }
 
 func (t *Transport) handlePacket(p receivedPacket) {
+	p.transport = t
 	if len(p.data) == 0 {
 		return
 	}

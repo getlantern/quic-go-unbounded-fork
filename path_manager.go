@@ -38,7 +38,8 @@ type path struct {
 }
 
 type pathManager struct {
-	nextPathID pathID
+	nextPathID   pathID
+	activePathID pathID
 	// ordered by lastPacketTime, with the most recently used path at the end
 	paths []*path
 
@@ -55,6 +56,7 @@ func newPathManager(
 ) *pathManager {
 	return &pathManager{
 		paths:        make([]*path, 0, maxPaths+1),
+		activePathID: invalidPathID,
 		getConnID:    getConnID,
 		retireConnID: retireConnID,
 		logger:       logger,
@@ -160,10 +162,17 @@ func (pm *pathManager) HandlePathResponseFrame(f *wire.PathResponseFrame) {
 
 // SwitchToPath is called when the connection switches to a new path
 func (pm *pathManager) SwitchToPath(addr net.Addr) {
+	// Retire the previous active path before forgetting its probing state.
+	// Otherwise every migration permanently consumes another connection ID.
+	if pm.activePathID != invalidPathID {
+		pm.retireConnID(pm.activePathID)
+	}
+	pm.activePathID = invalidPathID
 	// retire all other paths
 	for _, path := range pm.paths {
 		if addrsEqual(path.addr, addr) {
 			pm.logger.Debugf("switching to path %d (%s)", path.id, addr)
+			pm.activePathID = path.id
 			continue
 		}
 		pm.retireConnID(path.id)

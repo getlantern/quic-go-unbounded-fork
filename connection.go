@@ -45,7 +45,8 @@ type cryptoStreamHandler interface {
 }
 
 type receivedPacket struct {
-	buffer *packetBuffer
+	transport *Transport
+	buffer    *packetBuffer
 
 	remoteAddr net.Addr
 	rcvTime    monotime.Time
@@ -65,6 +66,7 @@ func (p *receivedPacket) Size() protocol.ByteCount { return protocol.ByteCount(l
 
 func (p *receivedPacket) Clone() *receivedPacket {
 	return &receivedPacket{
+		transport:  p.transport,
 		remoteAddr: p.remoteAddr,
 		rcvTime:    p.rcvTime,
 		data:       p.data,
@@ -921,6 +923,9 @@ func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
 	c.conn = newSendConn(tr.conn, c.conn.RemoteAddr(), packetInfo{}, utils.DefaultLogger) // TODO: find a better way
 	c.sendQueue.Close()
 	c.sendQueue = newSendQueue(c.conn)
+	// A server only switches its return path after a non-probing packet.
+	// Send one even if the application has no data queued on this endpoint.
+	c.queueControlFrame(&wire.PingFrame{})
 	go func() {
 		if err := c.sendQueue.Run(); err != nil {
 			c.destroyImpl(err)
@@ -1250,17 +1255,34 @@ func (c *Conn) handleShortHeaderPacket(
 			})
 		}
 	}
-	isNonProbing, pathChallenge, err := c.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log)
+	isNonProbing, pathChallenges, err := c.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log)
 	if err != nil {
 		return false, err
 	}
 
 	// In RFC 9000, only the client can migrate between paths.
 	if c.perspective == protocol.PerspectiveClient {
+		for _, challenge := range pathChallenges {
+			if err := c.respondToPathChallenge(p, challenge); err != nil {
+				return true, err
+			}
+		}
 		return true, nil
 	}
 	if addrsEqual(p.remoteAddr, c.RemoteAddr()) {
+		for _, challenge := range pathChallenges {
+			c.queueControlFrame(&wire.PathResponseFrame{Data: challenge.Data})
+		}
 		return true, nil
+	}
+	var pathChallenge *wire.PathChallengeFrame
+	if len(pathChallenges) > 0 {
+		pathChallenge = pathChallenges[len(pathChallenges)-1]
+		for _, challenge := range pathChallenges[:len(pathChallenges)-1] {
+			if err := c.respondToPathChallenge(p, challenge); err != nil {
+				return true, err
+			}
+		}
 	}
 
 	var shouldSwitchPath bool
@@ -1744,12 +1766,12 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
 	ecn protocol.ECN,
 	rcvTime monotime.Time,
 	log func([]qlog.Frame),
-) (isNonProbing bool, pathChallenge *wire.PathChallengeFrame, _ error) {
+) (isNonProbing bool, pathChallenges []*wire.PathChallengeFrame, _ error) {
 	c.lastPacketReceivedTime = rcvTime
 	c.firstAckElicitingPacketAfterIdleSentTime = 0
 	c.keepAlivePingSent = false
 
-	isAckEliciting, isNonProbing, pathChallenge, err := c.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime)
+	isAckEliciting, isNonProbing, pathChallenges, err := c.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime)
 	if err != nil {
 		return false, nil, err
 	}
@@ -1757,18 +1779,18 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
 	if err := c.receivedPacketHandler.ReceivedPacket(pn, ecn, protocol.Encryption1RTT, rcvTime, isAckEliciting); err != nil {
 		return false, nil, err
 	}
-	return isNonProbing, pathChallenge, nil
+	return isNonProbing, pathChallenges, nil
 }
 
 // handleFrames parses the frames, one after the other, and handles them.
-// It returns the last PATH_CHALLENGE frame contained in the packet, if any.
+// It returns the PATH_CHALLENGE frames contained in the packet, bounded by maxPathResponses.
 func (c *Conn) handleFrames(
 	data []byte,
 	destConnID protocol.ConnectionID,
 	encLevel protocol.EncryptionLevel,
 	log func([]qlog.Frame),
 	rcvTime monotime.Time,
-) (isAckEliciting, isNonProbing bool, pathChallenge *wire.PathChallengeFrame, _ error) {
+) (isAckEliciting, isNonProbing bool, pathChallenges []*wire.PathChallengeFrame, _ error) {
 	// Only used for tracing.
 	// If we're not tracing, this slice will always remain empty.
 	var frames []qlog.Frame
@@ -1862,8 +1884,8 @@ func (c *Conn) handleFrames(
 				continue
 			}
 			pc, err := c.handleFrame(frame, encLevel, destConnID, rcvTime)
-			if pc != nil {
-				pathChallenge = pc
+			if pc != nil && len(pathChallenges) < maxPathResponses {
+				pathChallenges = append(pathChallenges, pc)
 			}
 			handleErr = err
 		}
@@ -1925,7 +1947,6 @@ func (c *Conn) handleFrame(
 		err = c.streamsMap.HandleStopSendingFrame(frame)
 	case *wire.PingFrame:
 	case *wire.PathChallengeFrame:
-		c.handlePathChallengeFrame(frame)
 		pathChallenge = frame
 	case *wire.PathResponseFrame:
 		err = c.handlePathResponseFrame(frame)
@@ -1933,6 +1954,9 @@ func (c *Conn) handleFrame(
 		err = c.handleNewTokenFrame(frame)
 	case *wire.NewConnectionIDFrame:
 		err = c.connIDManager.Add(frame)
+		if err == nil && c.pathManagerOutgoing.Load() != nil {
+			c.scheduleSending()
+		}
 	case *wire.RetireConnectionIDFrame:
 		err = c.connIDGenerator.Retire(frame.SequenceNumber, destConnID, rcvTime.Add(3*c.rttStats.PTO(false)))
 	case *wire.HandshakeDoneFrame:
@@ -2046,10 +2070,18 @@ func (c *Conn) handleHandshakeEvents(now monotime.Time) error {
 	}
 }
 
-func (c *Conn) handlePathChallengeFrame(f *wire.PathChallengeFrame) {
-	if c.perspective == protocol.PerspectiveClient {
-		c.queueControlFrame(&wire.PathResponseFrame{Data: f.Data})
+// PATH_RESPONSE must travel on the path that carried PATH_CHALLENGE. Queueing
+// it as ordinary control traffic can send it down a dead path before Switch.
+func (c *Conn) respondToPathChallenge(p receivedPacket, f *wire.PathChallengeFrame) error {
+	probe, buf, err := c.packer.PackPathProbePacket(c.connIDManager.Get(),
+		[]ackhandler.Frame{{Frame: &wire.PathResponseFrame{Data: f.Data}}}, c.version)
+	if err != nil {
+		return err
 	}
+	c.logShortHeaderPacket(probe, protocol.ECNNon, buf.Len())
+	c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, p.rcvTime)
+	p.transport.queueProbe(buf, p.remoteAddr, p.info)
+	return nil
 }
 
 func (c *Conn) handlePathResponseFrame(f *wire.PathResponseFrame) error {
@@ -2451,6 +2483,28 @@ func (c *Conn) applyTransportParameters() {
 func (c *Conn) triggerSending(now monotime.Time) error {
 	c.pacingDeadline = 0
 
+	// A replacement path must be probed even when lost packets on the old
+	// path fill its congestion window. Otherwise a dead path prevents its own
+	// replacement. Probe retries are bounded by the path manager backoff.
+	if c.perspective == protocol.PerspectiveClient && c.handshakeConfirmed {
+		if pm := c.pathManagerOutgoing.Load(); pm != nil {
+			connID, frame, tr, ok := pm.NextPathToProbe()
+			if ok {
+				probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, c.version)
+				if err != nil {
+					return err
+				}
+				c.logger.Debugf("sending path probe packet from %s", c.LocalAddr())
+				c.logShortHeaderPacket(probe, protocol.ECNNon, buf.Len())
+				c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, now)
+				tr.queueProbe(buf, c.conn.RemoteAddr(), packetInfo{})
+				// There's (likely) more data to send. Loop around again.
+				c.scheduleSending()
+				return nil
+			}
+		}
+	}
+
 	sendMode := c.sentPacketHandler.SendMode(now)
 	switch sendMode {
 	case ackhandler.SendAny:
@@ -2489,25 +2543,6 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 }
 
 func (c *Conn) sendPackets(now monotime.Time) error {
-	if c.perspective == protocol.PerspectiveClient && c.handshakeConfirmed {
-		if pm := c.pathManagerOutgoing.Load(); pm != nil {
-			connID, frame, tr, ok := pm.NextPathToProbe()
-			if ok {
-				probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, c.version)
-				if err != nil {
-					return err
-				}
-				c.logger.Debugf("sending path probe packet from %s", c.LocalAddr())
-				c.logShortHeaderPacket(probe, protocol.ECNNon, buf.Len())
-				c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, now)
-				tr.WriteTo(buf.Data, c.conn.RemoteAddr())
-				// There's (likely) more data to send. Loop around again.
-				c.scheduleSending()
-				return nil
-			}
-		}
-	}
-
 	// Path MTU Discovery
 	// Can't use GSO, since we need to send a single packet that's larger than our current maximum size.
 	// Performance-wise, this doesn't matter, since we only send a very small (<10) number of

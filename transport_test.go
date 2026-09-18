@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -736,4 +737,54 @@ func testTransportReplaceWithClosed(t *testing.T, local bool) {
 		t.Logf("sent %d packets, received %d CONNECTION_CLOSE copies", numSent, received)
 		require.Equal(t, int(math.Ceil(math.Log2(float64(numSent)))), received)
 	})
+}
+
+type probeWriteConn struct {
+	rawConn
+	write func([]byte, net.Addr, []byte, uint16, protocol.ECN) (int, error)
+}
+
+func (c *probeWriteConn) WritePacket(b []byte, addr net.Addr, oob []byte, size uint16, ecn protocol.ECN) (int, error) {
+	return c.write(b, addr, oob, size, ecn)
+}
+
+func TestTransportProbeQueueBoundedAndSurvivesWriteError(t *testing.T) {
+	started, unblock, recovered := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	info := packetInfo{addr: netip.MustParseAddr("127.0.0.1")}
+	tr := &Transport{probeQueue: make(chan closePacket, maxPathResponses), listening: make(chan struct{}), logger: utils.DefaultLogger}
+	tr.initOnce.Do(func() {})
+	writes := 0
+	tr.conn = &probeWriteConn{write: func(_ []byte, _ net.Addr, oob []byte, _ uint16, _ protocol.ECN) (int, error) {
+		assert.Equal(t, info.OOB(), oob)
+		writes++
+		if writes == 1 {
+			close(started)
+			<-unblock
+			return 0, errors.New("temporary write failure")
+		}
+		if writes == 2 {
+			close(recovered)
+		}
+		return 1, nil
+	}}
+	done := make(chan struct{})
+	go func() { tr.runSendQueue(); close(done) }()
+	defer func() { close(tr.listening); <-done }()
+	queue := func() {
+		buf := getPacketBuffer()
+		buf.Data = append(buf.Data, 1)
+		tr.queueProbe(buf, &net.UDPAddr{}, info)
+	}
+	queue()
+	<-started
+	for range maxPathResponses + 1 {
+		queue()
+	}
+	require.Len(t, tr.probeQueue, maxPathResponses)
+	close(unblock)
+	select {
+	case <-recovered:
+	case <-time.After(time.Second):
+		t.Fatal("write failure stopped probe queue")
+	}
 }
